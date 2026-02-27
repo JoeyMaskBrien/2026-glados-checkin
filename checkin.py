@@ -11,11 +11,16 @@
 - 支持 Cookie-Editor 导出格式
 """
 
-import requests
+import base64
+import hashlib
+import hmac
 import json
 import os
 import sys
 import time
+from urllib.parse import quote_plus
+
+import requests
 from datetime import datetime
 
 # Fix Windows Unicode Output
@@ -86,6 +91,7 @@ class GLaDOS:
         self.points = "?"
         self.points_change = "?"
         self.exchange_info = ""
+        self.exchange_lines = []
         self.plan = "?"
         
     def req(self, method, path, data=None):
@@ -148,6 +154,7 @@ class GLaDOS:
                     exchange_lines.append(f"✅ {need}分→{days}天 (可兑换)")
                 else:
                     exchange_lines.append(f"❌ {need}分→{days}天 (差{need-pts}分)")
+            self.exchange_lines = exchange_lines
             self.exchange_info = "<br>".join(exchange_lines)
             return True
         return False
@@ -167,12 +174,53 @@ def pushplus(token, title, content):
     except:
         log("❌ PushPlus 推送失败")
 
+def dingtalk_sign(secret, timestamp):
+    """钉钉自定义机器人加签"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
+    return quote_plus(base64.b64encode(hmac_code))
+
+def build_dingtalk_url(webhook, secret):
+    if not webhook:
+        return ""
+    if not secret:
+        return webhook
+    timestamp = str(round(time.time() * 1000))
+    sign = dingtalk_sign(secret, timestamp)
+    sep = "&" if "?" in webhook else "?"
+    return f"{webhook}{sep}timestamp={timestamp}&sign={sign}"
+
+def dingtalk_push(webhook, secret, title, text):
+    if not webhook:
+        return
+    try:
+        url = build_dingtalk_url(webhook, secret)
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": text,
+            },
+        }
+        resp = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=8)
+        if resp.status_code != 200:
+            log(f"❌ 钉钉推送失败: HTTP {resp.status_code}")
+            return
+        data = resp.json()
+        if data.get("errcode") == 0:
+            log("✅ 钉钉推送成功")
+        else:
+            log(f"❌ 钉钉推送失败: {data.get('errmsg', 'unknown error')}")
+    except Exception as exc:
+        log(f"❌ 钉钉推送异常: {exc}")
+
 def main():
     log("🚀 2026 GLaDOS Checkin Starting...")
     cookies = get_cookies()
     if not cookies: sys.exit(1)
     
     results = []
+    dingtalk_blocks = []
     success_cnt = 0
     
     for i, cookie in enumerate(cookies, 1):
@@ -205,6 +253,17 @@ def main():
     </div>
 </div>
 """)
+        exchange_md = "\n".join([f"  - {line}" for line in g.exchange_lines]) if g.exchange_lines else "  - 暂无"
+        dingtalk_blocks.append(
+            "\n".join([
+                f"#### {g.email}",
+                f"- 当前积分：{g.points} ({g.points_change})",
+                f"- 剩余天数：{g.left_days} 天",
+                f"- 签到结果：{msg}",
+                "- 兑换选项：",
+                exchange_md,
+            ])
+        )
 
     # Push
     ptoken = os.environ.get("PUSHPLUS_TOKEN")
@@ -220,6 +279,19 @@ def main():
         content = "".join(results)
         content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
         pushplus(ptoken, title, content)
+
+    dingtalk_webhook = os.environ.get("DINGTALK_WEBHOOK", "").strip()
+    dingtalk_secret = os.environ.get("DINGTALK_SECRET", "").strip()
+    if dingtalk_webhook:
+        title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        text_parts = [
+            f"### {title}",
+            f"> 时间：{timestamp}",
+            "",
+        ]
+        text_parts.extend(dingtalk_blocks)
+        dingtalk_push(dingtalk_webhook, dingtalk_secret or None, title, "\n\n".join(text_parts))
 
 if __name__ == '__main__':
     main()
